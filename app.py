@@ -6,11 +6,12 @@ import tempfile
 import os
 from bs4 import BeautifulSoup
 import time # リトライ時のwait用
+import prompts # プロンプト定義ファイル
 
 # APIキー設定（Streamlitのsecretsか環境変数から）
 # api_key = os.environ.get("GEMINI_API_KEY") 
 
-st.title("決算書まとめBot（新SDK対応版）")
+st.title("決算書まとめBot v0.2.1β")
 
 if "chat_session" not in st.session_state:
     st.session_state.chat_session = None
@@ -37,18 +38,23 @@ if uploaded_file and not st.session_state.summary_done:
         file_ext = os.path.splitext(uploaded_file.name)[1].lower()
 
         if file_ext == ".pdf":
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
-                tmp_path = tmp_file.name
-            
-            # 【変更点1】ファイルアップロード
-            # config引数でdisplay_nameを指定する
-            uploaded_gemini_file = client.files.upload(
-                file=tmp_path, 
-                config={'display_name': 'Earnings Report PDF'}
-            )
-            content_to_send = uploaded_gemini_file
-            os.remove(tmp_path) 
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                    tmp_file.write(uploaded_file.getvalue())
+                    tmp_path = tmp_file.name
+                
+                # 【変更点1】ファイルアップロード
+                # config引数でdisplay_nameを指定する
+                uploaded_gemini_file = client.files.upload(
+                    file=tmp_path, 
+                    config={'display_name': 'Earnings Report PDF'}
+                )
+                content_to_send = uploaded_gemini_file
+            finally:
+                # 確実にファイルを削除する
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path) 
 
         elif file_ext in [".htm", ".html"]:
             # HTML処理（BeautifulSoup部分はそのまま）
@@ -68,9 +74,9 @@ if uploaded_file and not st.session_state.summary_done:
 
         # 【変更点2】チャット開始 & エラーハンドリング/Fallback実装
         # 設定を共通化
-        system_instruction = "あなたはプロの機関投資家です。ユーザーの質問には日本語で、数値に基づき正確に答えてください。HTMLタグが含まれている場合は、タグを無視して本文の内容を分析してください。出力した文の最後には必ず「※本システムはAIによる自動生成であり、情報の正確性を保証するものではありません。投資判断は自己責任でお願いします。」と書きなさい。"
+        # system_instruction は prompts.py から読み込む
         generation_config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
+            system_instruction=prompts.SYSTEM_INSTRUCTION,
             temperature=0.2
         )
 
@@ -80,7 +86,7 @@ if uploaded_file and not st.session_state.summary_done:
         
         # 【変更点3】最初のメッセージ送信とFallbackループ
         # PDF(File object)とテキストを混ぜて送る場合
-        prompt_text = "この資料の要点を、財務ハイライト、将来の見通し、懸念点の3つに分けて日本語で「プロの機関投資家」という文言を使わず、前置きなしでまとめてください。最初に会社名を示してください。その後、この資料の要点を以下の見出しで日本語でまとめて。その際、該当する内容が添付ファイル内にない場合はその章は「情報なし」と書くこと。ただし「競合他社に対する優位性」と「競合他社に対する劣位性」については記載がない場合は、リスク要因（Risk Factors）や財務状況から競合他社と比較して弱点となり得る要素を推論して記述してください。以下は使用する見出しです。強調と改行をして表示させなさい。1.会社について,1-1.セグメント別事業内容,1-2.大型契約情報,1-3.競合他社に対する優位性,1-4.競合他社に対する劣位性,2.財務ハイライト,2-1.売上高,2-2.営業利益,2-3.株当たり利益,2-4.キャッシュフロー,2-5.賃借対照表,2-6.売上高の変動要因,3.将来の見通し,3-1.業績予想,3-2.事業拡大と政府支援,3-3.セグメント別成長期待,4.懸念点"
+        prompt_text = prompts.PROMPT_FINANCIAL_SUMMARY
         
         models_to_try = [primary_model, fallback_model]
         active_chat = None
@@ -157,14 +163,12 @@ if prompt := st.chat_input("他に聞きたいことは？"):
                         # 注意: 古いhistoryには前回のやり取りが含まれている
                         old_history = st.session_state.chat_session.history
                         
-                        # System instruction再定義（簡略化のため再記述または共通変数から取得が望ましいが、ここではハードコード回避のためsessionから取れればベストだがconfigは見えないことが多い）
-                        # ※コード上部の変数スコープはこのifブロック内では見えない可能性があるため、再定義します
-                        system_instruction_retry = "あなたはプロの機関投資家です。ユーザーの質問には日本語で、数値に基づき正確に答えてください。HTMLタグが含まれている場合は、タグを無視して本文の内容を分析してください。出力した文の最後には必ず「※本システムはAIによる自動生成であり、情報の正確性を保証するものではありません。投資判断は自己責任でお願いします。」と書きなさい。"
+                        # System instruction再定義（prompts.pyから参照）
                         
                         new_chat = client.chats.create(
                             model=fallback_model,
                             config=types.GenerateContentConfig(
-                                system_instruction=system_instruction_retry,
+                                system_instruction=prompts.SYSTEM_INSTRUCTION,
                                 temperature=0.2
                             ),
                             history=old_history
@@ -187,5 +191,4 @@ if prompt := st.chat_input("他に聞きたいことは？"):
                     st.error(f"エラーが発生しました: {e}")
 
             except Exception as e:
-
                 st.error(f"予期せぬエラーが発生しました: {e}")
