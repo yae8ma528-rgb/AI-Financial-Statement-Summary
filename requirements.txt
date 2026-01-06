@@ -1,0 +1,5 @@
+streamlit
+genai
+tempfile
+os
+bs4
