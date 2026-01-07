@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components # Javascript注入用
 from google import genai  # ← ここが変わった！
 from google.genai import types
 from google.genai import errors # エラーハンドリング用
@@ -7,11 +8,58 @@ import os
 from bs4 import BeautifulSoup
 import time # リトライ時のwait用
 import prompts # プロンプト定義ファイル
+import uuid # リセット時のキー生成用
 
 # APIキー設定（Streamlitのsecretsか環境変数から）
 # api_key = os.environ.get("GEMINI_API_KEY") 
 
-st.title("決算書まとめBot v0.2.1β")
+st.set_page_config(
+    page_title="決算書まとめBot",
+    page_icon="🤖",
+    layout="centered",
+)
+
+# ブラウザに日本語サイトとして認識させるためのJavascriptハック
+# st.markdownではスクリプトが実行されない場合があるためcomponentsを使用
+components.html("""
+    <script>
+        window.parent.document.getElementsByTagName('html')[0].lang = 'ja';
+    </script>
+""", height=0) 
+
+st.title("決算書まとめBot v0.2.2β")
+
+# サイドバー: リセット機能
+with st.sidebar:
+    st.header("メニュー")
+    if st.button("分析をリセット"):
+        st.session_state.confirm_reset = True
+
+    if st.session_state.get("confirm_reset"):
+        st.warning("本当にリセットしますか？\n会話履歴とアップロードしたファイルが削除されます。")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("削除"):
+                # Gemini上のファイルを削除
+                if st.session_state.get("uploaded_gemini_file_name"):
+                    try:
+                        client = get_gemini_client()
+                        client.files.delete(name=st.session_state.uploaded_gemini_file_name)
+                        st.sidebar.success("クラウド上のファイルを削除しました")
+                    except Exception as e:
+                        st.sidebar.error(f"ファイル削除エラー: {e}")
+                
+                # セッション初期化
+                for key in list(st.session_state.keys()):
+                    del st.session_state[key]
+                
+                # 新しいuploader_keyを設定してリセット
+                st.session_state.uploader_key = str(uuid.uuid4())
+                st.rerun()
+        with col2:
+            if st.button("キャンセル"):
+                st.session_state.confirm_reset = False
+                st.rerun()
 
 if "chat_session" not in st.session_state:
     st.session_state.chat_session = None
@@ -19,6 +67,10 @@ if "summary_done" not in st.session_state:
     st.session_state.summary_done = False
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "uploaded_gemini_file_name" not in st.session_state:
+    st.session_state.uploaded_gemini_file_name = None
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = str(uuid.uuid4())
 
 # クライアントの初期化
 @st.cache_resource
@@ -27,7 +79,7 @@ def get_gemini_client():
 
 client = get_gemini_client()
 
-uploaded_file = st.file_uploader("決算書(PDF or HTML)を添付してください。", type=["pdf", "htm", "html"])
+uploaded_file = st.file_uploader("決算書(PDF or HTML)を添付してください。", type=["pdf", "htm", "html"], key=st.session_state.uploader_key)
 
 if uploaded_file and not st.session_state.summary_done:
     with st.spinner("AIが解析中です..."):
@@ -51,6 +103,8 @@ if uploaded_file and not st.session_state.summary_done:
                     config={'display_name': 'Earnings Report PDF'}
                 )
                 content_to_send = uploaded_gemini_file
+                # リセット用にファイル名を保存
+                st.session_state.uploaded_gemini_file_name = uploaded_gemini_file.name
             finally:
                 # 確実にファイルを削除する
                 if tmp_path and os.path.exists(tmp_path):
