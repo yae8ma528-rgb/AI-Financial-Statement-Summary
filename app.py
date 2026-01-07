@@ -19,7 +19,7 @@ st.set_page_config(
 # 日本語設定ハック
 utils.setup_japanese_language()
 
-st.title("決算書まとめBot v0.3.2β")
+st.title("決算書まとめBot v0.3.3β")
 
 # クライアント取得
 client = gemini_logic.get_gemini_client()
@@ -164,30 +164,43 @@ if st.session_state.current_page == "main":
                             contents_to_send.append(clean_text)
                 
                 if contents_to_send:
-                    # API呼び出し (ストリーミング)
-                    chat, response_stream, used_model = gemini_logic.send_message_stream_with_fallback(
-                        client,
-                        contents_to_send,
-                        target_prompt,
-                        prompts.SYSTEM_INSTRUCTION
-                    )
-                    
-                    if chat and response_stream:
-                        st.session_state.chat_session = chat
-                        st.session_state.current_model = used_model
+                    # リトライループ (最大3回)
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            # API呼び出し (ストリーミング)
+                            chat, response_stream, used_model = gemini_logic.send_message_stream_with_fallback(
+                                client,
+                                contents_to_send,
+                                target_prompt,
+                                prompts.SYSTEM_INSTRUCTION
+                            )
+                            
+                            if chat and response_stream:
+                                st.session_state.chat_session = chat
+                                st.session_state.current_model = used_model
+                                
+                                # ストリーミング表示
+                                with st.chat_message("assistant"):
+                                    # st.write_stream はジェネレータを受け取り、完了後に全テキストを返す
+                                    # gemini_logic側でテキスト抽出とクリーニングを行っているのでそのまま渡す
+                                    full_response_text = st.write_stream(response_stream)
+                                
+                                # 履歴保存
+                                st.session_state.messages.append({"role": "assistant", "content": full_response_text})
+                                st.session_state.summary_done = True
+                                st.rerun()
+                                break # 成功したらループを抜ける
+                            else:
+                                if attempt == max_retries - 1:
+                                    st.error("解析に失敗しました。")
                         
-                        # ストリーミング表示
-                        with st.chat_message("assistant"):
-                            # st.write_stream はジェネレータを受け取り、完了後に全テキストを返す
-                            # gemini_logic側でテキスト抽出とクリーニングを行っているのでそのまま渡す
-                            full_response_text = st.write_stream(response_stream)
-                        
-                        # 履歴保存
-                        st.session_state.messages.append({"role": "assistant", "content": full_response_text})
-                        st.session_state.summary_done = True
-                        st.rerun()
-                    else:
-                        st.error("解析に失敗しました。")
+                        except (errors.ClientError, errors.ServerError) as e:
+                            if attempt < max_retries - 1:
+                                st.warning(f"通信エラーが発生しました。再試行します... ({attempt+1}/{max_retries})")
+                                time.sleep(2)
+                            else:
+                                st.error(f"エラーにより解析を完了できませんでした: {e}")
 
     # --- チャットインターフェース ---
     for message in st.session_state.messages:
@@ -205,52 +218,63 @@ if st.session_state.current_page == "main":
             with st.spinner("思考中..."):
                 try:
                     current_chat = st.session_state.chat_session
-                    try:
-                        # ストリーミング送信
-                        response_stream = current_chat.send_message_stream(prompt)
-                        
-                        with st.chat_message("assistant"):
-                            # gemini_logic側でクリーニング済みだが、ここは直接 stream を持っている
-                            # 直接callした場合(line 181)、response_streamは生のiterator
-                            # なのでここでクリーニングが必要
+                    max_retries = 3
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            response_stream = None
                             
-                            full_response_text = st.write_stream(gemini_logic.clean_stream_generator(response_stream))
-                        
-                        st.session_state.messages.append({"role": "assistant", "content": full_response_text})
-
-                    except errors.ClientError as e:
-                         # 429等の場合、新しいセッションでリトライを試みる
-                         if e.code == 429 or "429" in str(e):
-                            st.warning("モデルが混雑しています。別のモデルで再試行します...")
-                            time.sleep(1)
+                            # 1回目は既存のセッションで試行
+                            if attempt == 0:
+                                response_stream = current_chat.send_message_stream(prompt)
+                                # 生のイテレータをクリーニング用ジェネレータでラップ
+                                clean_stream = gemini_logic.clean_stream_generator(response_stream)
                             
-                            # 履歴取得
-                            old_history = current_chat.history
-                            
-                            # 新しいセッションでリトライ (ストリーミング)
-                            new_chat, response_stream, used_model = gemini_logic.send_message_stream_with_fallback(
-                                client,
-                                content=[], # コンテンツなし（テキストのみ）
-                                prompt=prompt,
-                                system_instruction=prompts.SYSTEM_INSTRUCTION,
-                                previous_history=old_history
-                            )
-                            
-                            if new_chat and response_stream:
-                                st.session_state.chat_session = new_chat
-                                st.session_state.current_model = used_model
-                                
-                                with st.chat_message("assistant"):
-                                    full_response_text = st.write_stream(response_stream)
-                                
-                                st.session_state.messages.append({"role": "assistant", "content": full_response_text})
+                            # 2回目以降（リトライ）は新しいセッションを作り直す
                             else:
-                                st.error("再試行に失敗しました。")
-                         else:
-                            st.error(f"エラー: {e}")
+                                st.warning(f"混雑しています。バックアップ回線で再接続中... ({attempt}/{max_retries-1})")
+                                time.sleep(2)
+                                
+                                old_history = current_chat.history
+                                new_chat, new_stream, used_model = gemini_logic.send_message_stream_with_fallback(
+                                    client,
+                                    content=[], 
+                                    prompt=prompt,
+                                    system_instruction=prompts.SYSTEM_INSTRUCTION,
+                                    previous_history=old_history
+                                )
+                                
+                                if new_chat and new_stream:
+                                    st.session_state.chat_session = new_chat
+                                    st.session_state.current_model = used_model
+                                    current_chat = new_chat # ループ内での参照用
+                                    clean_stream = new_stream # これは既にクリーニング済み（fallback関数戻り値）
+                                else:
+                                    raise Exception("Retry session creation failed")
+
+                            with st.chat_message("assistant"):
+                                full_response_text = st.write_stream(clean_stream)
+                            
+                            st.session_state.messages.append({"role": "assistant", "content": full_response_text})
+                            break # 成功終了
+
+                        except (errors.ClientError, errors.ServerError) as e:
+                            # 429/503はリトライ対象
+                            if e.code in [429, 503] or "429" in str(e) or "503" in str(e):
+                                if attempt == max_retries - 1:
+                                    st.error(f"申し訳ありません、サーバーが大変混雑しており応答できませんでした。しばらく待ってから再度お試しください。({e})")
+                            else:
+                                # その他のAPIエラーは即終了
+                                st.error(f"APIエラー: {e}")
+                                break
+                                
+                        except Exception as e:
+                             if attempt == max_retries - 1:
+                                st.error(f"予期せぬエラー: {e}")
+                             # それ以外はリトライ続行
 
                 except Exception as e:
-                    st.error(f"予期せぬエラーが発生しました: {e}")
+                    st.error(f"システムエラー: {e}")
 
 elif st.session_state.current_page == "help":
     st.header("使い方")
