@@ -2,11 +2,11 @@ import streamlit as st
 import time
 import os
 import uuid
-import platform
 import prompts
 import utils
 import gemini_logic
 import help
+import update_history
 from google.genai import errors
 
 # ページ設定
@@ -19,7 +19,7 @@ st.set_page_config(
 # 日本語設定ハック
 utils.setup_japanese_language()
 
-st.title("決算書まとめBot v0.3.1β")
+st.title("決算書まとめBot v0.3.2β")
 
 # クライアント取得
 client = gemini_logic.get_gemini_client()
@@ -32,14 +32,17 @@ with st.sidebar:
     st.header("メニュー")
     
     # ページ切り替えボタン
-    if st.session_state.current_page == "main":
-        if st.button("使い方を見る"):
-            st.session_state.current_page = "help"
-            st.rerun()
-    else:
-        if st.button("分析に戻る"):
-            st.session_state.current_page = "main"
-            st.rerun()
+    if st.button("ホーム"):
+        st.session_state.current_page = "main"
+        st.rerun()
+
+    if st.button("使い方"):
+        st.session_state.current_page = "help"
+        st.rerun()
+        
+    if st.button("更新履歴"):
+        st.session_state.current_page = "history"
+        st.rerun()
 
     st.divider()
 
@@ -207,14 +210,11 @@ if st.session_state.current_page == "main":
                         response_stream = current_chat.send_message_stream(prompt)
                         
                         with st.chat_message("assistant"):
-                             # gemini_logic側でクリーニング済みだが、ここは直接 stream を持っている
-                             # 直接callした場合(line 181)、response_streamは生のiterator
-                             # なのでここでクリーニングが必要
-                             def clean_gen(s):
-                                for c in s:
-                                    if c.text: yield c.text.replace("\\n", "\n")
-                             
-                             full_response_text = st.write_stream(clean_gen(response_stream))
+                            # gemini_logic側でクリーニング済みだが、ここは直接 stream を持っている
+                            # 直接callした場合(line 181)、response_streamは生のiterator
+                            # なのでここでクリーニングが必要
+                            
+                            full_response_text = st.write_stream(gemini_logic.clean_stream_generator(response_stream))
                         
                         st.session_state.messages.append({"role": "assistant", "content": full_response_text})
 
@@ -255,3 +255,7 @@ if st.session_state.current_page == "main":
 elif st.session_state.current_page == "help":
     st.header("使い方")
     st.markdown(help.HELP_MARKDOWN)
+
+elif st.session_state.current_page == "history":
+    st.header("更新履歴")
+    st.markdown(update_history.UPDATE_HISTORY_MARKDOWN)
