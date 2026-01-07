@@ -1,37 +1,48 @@
 import streamlit as st
-import streamlit.components.v1 as components # Javascript注入用
-from google import genai  # ← ここが変わった！
-from google.genai import types
-from google.genai import errors # エラーハンドリング用
-import tempfile
+import time
 import os
-from bs4 import BeautifulSoup
-import time # リトライ時のwait用
-import prompts # プロンプト定義ファイル
-import uuid # リセット時のキー生成用
+import uuid
+import platform
+import prompts
+import utils
+import gemini_logic
+import help
+from google.genai import errors
 
-# APIキー設定（Streamlitのsecretsか環境変数から）
-# api_key = os.environ.get("GEMINI_API_KEY") 
-
+# ページ設定
 st.set_page_config(
     page_title="決算書まとめBot",
     page_icon="🤖",
     layout="centered",
 )
 
-# ブラウザに日本語サイトとして認識させるためのJavascriptハック
-# st.markdownではスクリプトが実行されない場合があるためcomponentsを使用
-components.html("""
-    <script>
-        window.parent.document.getElementsByTagName('html')[0].lang = 'ja';
-    </script>
-""", height=0) 
+# 日本語設定ハック
+utils.setup_japanese_language()
 
-st.title("決算書まとめBot v0.2.2β")
+st.title("決算書まとめBot v0.3.1β")
 
-# サイドバー: リセット機能
+# クライアント取得
+client = gemini_logic.get_gemini_client()
+
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "main"
+
+# --- サイドバー: メニュー ---
 with st.sidebar:
     st.header("メニュー")
+    
+    # ページ切り替えボタン
+    if st.session_state.current_page == "main":
+        if st.button("使い方を見る"):
+            st.session_state.current_page = "help"
+            st.rerun()
+    else:
+        if st.button("分析に戻る"):
+            st.session_state.current_page = "main"
+            st.rerun()
+
+    st.divider()
+
     if st.button("分析をリセット"):
         st.session_state.confirm_reset = True
 
@@ -40,209 +51,207 @@ with st.sidebar:
         col1, col2 = st.columns(2)
         with col1:
             if st.button("削除"):
-                # Gemini上のファイルを削除
-                if st.session_state.get("uploaded_gemini_file_name"):
-                    try:
-                        client = get_gemini_client()
-                        client.files.delete(name=st.session_state.uploaded_gemini_file_name)
-                        st.sidebar.success("クラウド上のファイルを削除しました")
-                    except Exception as e:
-                        st.sidebar.error(f"ファイル削除エラー: {e}")
+                # クラウド上のファイルを削除
+                if st.session_state.get("uploaded_gemini_file_names"):
+                    gemini_logic.delete_files_from_gemini(client, st.session_state.uploaded_gemini_file_names)
+                    st.sidebar.success("クラウド上のファイルを全て削除しました")
                 
-                # セッション初期化
+                # セッション初期化 (current_pageは維持するか、mainに戻すか。ここではmainに戻す)
                 for key in list(st.session_state.keys()):
                     del st.session_state[key]
                 
                 # 新しいuploader_keyを設定してリセット
                 st.session_state.uploader_key = str(uuid.uuid4())
+                st.session_state.current_page = "main"
                 st.rerun()
         with col2:
             if st.button("キャンセル"):
                 st.session_state.confirm_reset = False
                 st.rerun()
 
+# --- セッション状態の初期化 (削除後も再生成されるように配置) ---
+# 他のsession state初期化は下にあるのでcurrent_pageだけここでも確認（リセット直後用）
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "main"
 if "chat_session" not in st.session_state:
     st.session_state.chat_session = None
 if "summary_done" not in st.session_state:
     st.session_state.summary_done = False
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "uploaded_gemini_file_name" not in st.session_state:
-    st.session_state.uploaded_gemini_file_name = None
+if "uploaded_gemini_file_names" not in st.session_state:
+    st.session_state.uploaded_gemini_file_names = []
+if "analysis_mode" not in st.session_state:
+    st.session_state.analysis_mode = None 
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = str(uuid.uuid4())
 
-# クライアントの初期化
-@st.cache_resource
-def get_gemini_client():
-    return genai.Client(api_key=st.secrets["GEMINI_API_KEY"]) # キーは適切に設定
+# コールバック関数
+def set_analysis_mode(mode):
+    st.session_state.analysis_mode = mode
 
-client = get_gemini_client()
+# --- メインロジック ---
 
-uploaded_file = st.file_uploader("決算書(PDF or HTML)を添付してください。", type=["pdf", "htm", "html"], key=st.session_state.uploader_key)
+# --- メインロジック ---
+if st.session_state.current_page == "main":
+    uploaded_files = st.file_uploader(
+        "決算書(PDF or HTML)を添付してください。", 
+        type=["pdf", "htm", "html"], 
+        key=st.session_state.uploader_key, 
+        accept_multiple_files=True
+    )
 
-if uploaded_file and not st.session_state.summary_done:
-    with st.spinner("AIが解析中です..."):
+    if uploaded_files and not st.session_state.summary_done:
         
-        content_to_send = "" # 文字列またはファイルオブジェクトが入る
+        # 処理対象の決定とプロンプト選択
+        should_process = False
+        target_prompt = None
         
-        # ファイル処理（ここはロジック同じ）
-        file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-
-        if file_ext == ".pdf":
-            tmp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                    tmp_file.write(uploaded_file.getvalue())
-                    tmp_path = tmp_file.name
-                
-                # 【変更点1】ファイルアップロード
-                # config引数でdisplay_nameを指定する
-                uploaded_gemini_file = client.files.upload(
-                    file=tmp_path, 
-                    config={'display_name': 'Earnings Report PDF'}
-                )
-                content_to_send = uploaded_gemini_file
-                # リセット用にファイル名を保存
-                st.session_state.uploaded_gemini_file_name = uploaded_gemini_file.name
-            finally:
-                # 確実にファイルを削除する
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path) 
-
-        elif file_ext in [".htm", ".html"]:
-            # HTML処理（BeautifulSoup部分はそのまま）
-            try:
-                html_content = uploaded_file.getvalue().decode("utf-8")
-            except UnicodeDecodeError:
-                html_content = uploaded_file.getvalue().decode("cp932")
-            
-            soup = BeautifulSoup(html_content, 'html.parser')
-            for script_or_style in soup(["script", "style"]):
-                script_or_style.decompose()
-            text_data = soup.get_text(separator="\n") 
-            lines = [line.strip() for line in text_data.splitlines() if line.strip()]
-            clean_text = "\n".join(lines)
-            
-            content_to_send = clean_text
-
-        # 【変更点2】チャット開始 & エラーハンドリング/Fallback実装
-        # 設定を共通化
-        # system_instruction は prompts.py から読み込む
-        generation_config = types.GenerateContentConfig(
-            system_instruction=prompts.SYSTEM_INSTRUCTION,
-            temperature=0.2
-        )
-
-        # モデル定義
-        primary_model = "gemini-2.5-flash"
-        fallback_model = "gemini-2.5-flash-lite"
+        # 1ファイル: 自動実行
+        if len(uploaded_files) == 1:
+            should_process = True
+            target_prompt = prompts.PROMPT_FINANCIAL_SUMMARY
         
-        # 【変更点3】最初のメッセージ送信とFallbackループ
-        # PDF(File object)とテキストを混ぜて送る場合
-        prompt_text = prompts.PROMPT_FINANCIAL_SUMMARY
-        
-        models_to_try = [primary_model, fallback_model]
-        active_chat = None
-        response_text = ""
-
-        for model_name in models_to_try:
-            try:
-                # Chatセッション作成
-                chat = client.chats.create(
-                    model=model_name,
-                    config=generation_config,
-                    history=[]
-                )
-                
-                # 送信
-                response = chat.send_message([content_to_send, prompt_text])
-                
-                # 成功したらループを抜ける
-                active_chat = chat
-                response_text = response.text
-                st.session_state.current_model = model_name # 現在のモデルを保存
-                break
-
-            except errors.ClientError as e:
-                # 429 Resource Exhausted (Rate Limit) の場合
-                if e.code == 429 or "429" in str(e):
-                    st.warning(f"モデル {model_name} が混雑しています(429)。次のモデルに切り替えます...")
-                    time.sleep(1) # 一呼吸置く
-                    continue
-                else:
-                    st.error(f"APIエラーが発生しました: {e}")
-                    break
-            except Exception as e:
-                st.error(f"予期せぬエラーが発生しました: {e}")
-                break
-        
-        if active_chat:
-            st.session_state.chat_session = active_chat
-            st.session_state.messages.append({"role": "assistant", "content": response_text})
-            st.session_state.summary_done = True
+        # 複数ファイル: モード選択待機
         else:
-            st.error("すべてのモデルでの解析に失敗しました。しばらく待ってから再試行してください。")
+            # モード未選択時はボタン表示
+            if st.session_state.analysis_mode is None:
+                st.info(f"{len(uploaded_files)} 個のファイルが選択されました。実行する分析を選択してください。")
+                col1, col2 = st.columns(2)
+                col1.button("1社の長期トレンド分析", on_click=set_analysis_mode, args=("trend",))
+                col2.button("複数社の比較", on_click=set_analysis_mode, args=("compare",))
+            
+            # モード選択済み
+            elif st.session_state.analysis_mode:
+                should_process = True
+                if st.session_state.analysis_mode == "trend":
+                    target_prompt = prompts.PROMPT_TREND_ANALYSIS
+                elif st.session_state.analysis_mode == "compare":
+                    target_prompt = prompts.PROMPT_COMPANY_COMPARISON
 
-# 表示部分は変更なし
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-if prompt := st.chat_input("他に聞きたいことは？"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    if st.session_state.chat_session:
-        with st.spinner("思考中..."):
-            try:
-                # 既存のセッションでトライ
-                response = st.session_state.chat_session.send_message(prompt)
-                st.session_state.messages.append({"role": "assistant", "content": response.text})
-                with st.chat_message("assistant"):
-                    st.markdown(response.text)
-
-            except errors.ClientError as e:
-                # 429発生時、かつ今のモデルがprimaryならfallbackへ移行
-                is_rate_limit = e.code == 429 or "429" in str(e)
-                current_model = st.session_state.get("current_model", "gemini-2.5-flash")
-                fallback_model = "gemini-2.5-flash-lite"
+        # --- 分析実行フロー ---
+        if should_process and target_prompt:
+            with st.spinner("AIが解析中です..."):
                 
-                if is_rate_limit and current_model != fallback_model:
-                    st.warning(f"モデル {current_model} が混雑しています。{fallback_model} に切り替えて再試行します...")
+                contents_to_send = []
+                
+                for u_file in uploaded_files:
+                    # ユーティリティでファイルを処理
+                    processed_data = utils.process_uploaded_file(u_file)
                     
-                    try:
-                        # 履歴を引き継いで新しいチャットセッションを作成
-                        # 注意: 古いhistoryには前回のやり取りが含まれている
-                        old_history = st.session_state.chat_session.history
-                        
-                        # System instruction再定義（prompts.pyから参照）
-                        
-                        new_chat = client.chats.create(
-                            model=fallback_model,
-                            config=types.GenerateContentConfig(
-                                system_instruction=prompts.SYSTEM_INSTRUCTION,
-                                temperature=0.2
-                            ),
-                            history=old_history
-                        )
-                        
-                        # 再送信
-                        response = new_chat.send_message(prompt)
-                        
-                        # セッション更新
-                        st.session_state.chat_session = new_chat
-                        st.session_state.current_model = fallback_model
-                        
-                        st.session_state.messages.append({"role": "assistant", "content": response.text})
-                        with st.chat_message("assistant"):
-                            st.markdown(response.text)
-                            
-                    except Exception as retry_e:
-                        st.error(f"再試行も失敗しました: {retry_e}")
-                else:
-                    st.error(f"エラーが発生しました: {e}")
+                    if processed_data:
+                        if processed_data["type"] == "pdf":
+                            # PDFはアップロードが必要
+                             try:
+                                uploaded_gemini_file = gemini_logic.upload_file_to_gemini(
+                                    client, 
+                                    processed_data["content"], # ここはファイルパス
+                                    processed_data["display_name"]
+                                )
+                                contents_to_send.append(uploaded_gemini_file)
+                                st.session_state.uploaded_gemini_file_names.append(uploaded_gemini_file.name)
+                             finally:
+                                 # 一時ファイル削除
+                                 if processed_data["tmp_path"] and os.path.exists(processed_data["tmp_path"]):
+                                     os.remove(processed_data["tmp_path"])
 
-            except Exception as e:
-                st.error(f"予期せぬエラーが発生しました: {e}")
+                        elif processed_data["type"] == "html":
+                            # HTMLテキストはヘッダーをつけて追加
+                            clean_text = f"--- File: {processed_data['display_name']} ---\n{processed_data['content']}"
+                            contents_to_send.append(clean_text)
+                
+                if contents_to_send:
+                    # API呼び出し (ストリーミング)
+                    chat, response_stream, used_model = gemini_logic.send_message_stream_with_fallback(
+                        client,
+                        contents_to_send,
+                        target_prompt,
+                        prompts.SYSTEM_INSTRUCTION
+                    )
+                    
+                    if chat and response_stream:
+                        st.session_state.chat_session = chat
+                        st.session_state.current_model = used_model
+                        
+                        # ストリーミング表示
+                        with st.chat_message("assistant"):
+                            # st.write_stream はジェネレータを受け取り、完了後に全テキストを返す
+                            # gemini_logic側でテキスト抽出とクリーニングを行っているのでそのまま渡す
+                            full_response_text = st.write_stream(response_stream)
+                        
+                        # 履歴保存
+                        st.session_state.messages.append({"role": "assistant", "content": full_response_text})
+                        st.session_state.summary_done = True
+                        st.rerun()
+                    else:
+                        st.error("解析に失敗しました。")
+
+    # --- チャットインターフェース ---
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("他に聞きたいことは？"):
+        if not st.session_state.chat_session:
+            st.toast("先ファイルをアップロードして分析を行ってください。", icon="⚠️")
+        else:
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            with st.spinner("思考中..."):
+                try:
+                    current_chat = st.session_state.chat_session
+                    try:
+                        # ストリーミング送信
+                        response_stream = current_chat.send_message_stream(prompt)
+                        
+                        with st.chat_message("assistant"):
+                             # gemini_logic側でクリーニング済みだが、ここは直接 stream を持っている
+                             # 直接callした場合(line 181)、response_streamは生のiterator
+                             # なのでここでクリーニングが必要
+                             def clean_gen(s):
+                                for c in s:
+                                    if c.text: yield c.text.replace("\\n", "\n")
+                             
+                             full_response_text = st.write_stream(clean_gen(response_stream))
+                        
+                        st.session_state.messages.append({"role": "assistant", "content": full_response_text})
+
+                    except errors.ClientError as e:
+                         # 429等の場合、新しいセッションでリトライを試みる
+                         if e.code == 429 or "429" in str(e):
+                            st.warning("モデルが混雑しています。別のモデルで再試行します...")
+                            time.sleep(1)
+                            
+                            # 履歴取得
+                            old_history = current_chat.history
+                            
+                            # 新しいセッションでリトライ (ストリーミング)
+                            new_chat, response_stream, used_model = gemini_logic.send_message_stream_with_fallback(
+                                client,
+                                content=[], # コンテンツなし（テキストのみ）
+                                prompt=prompt,
+                                system_instruction=prompts.SYSTEM_INSTRUCTION,
+                                previous_history=old_history
+                            )
+                            
+                            if new_chat and response_stream:
+                                st.session_state.chat_session = new_chat
+                                st.session_state.current_model = used_model
+                                
+                                with st.chat_message("assistant"):
+                                    full_response_text = st.write_stream(response_stream)
+                                
+                                st.session_state.messages.append({"role": "assistant", "content": full_response_text})
+                            else:
+                                st.error("再試行に失敗しました。")
+                         else:
+                            st.error(f"エラー: {e}")
+
+                except Exception as e:
+                    st.error(f"予期せぬエラーが発生しました: {e}")
+
+elif st.session_state.current_page == "help":
+    st.header("使い方")
+    st.markdown(help.HELP_MARKDOWN)
