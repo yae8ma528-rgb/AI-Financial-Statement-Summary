@@ -209,7 +209,7 @@ if st.session_state.current_page == "main":
 
     if prompt := st.chat_input("他に聞きたいことは？"):
         if not st.session_state.chat_session:
-            st.toast("先ファイルをアップロードして分析を行ってください。", icon="⚠️")
+            st.toast("先にファイルをアップロードして分析を行ってください。", icon="⚠️")
         else:
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
@@ -282,4 +282,5 @@ elif st.session_state.current_page == "help":
 
 elif st.session_state.current_page == "history":
     st.header("更新履歴")
+
     st.markdown(update_history.UPDATE_HISTORY_MARKDOWN)
